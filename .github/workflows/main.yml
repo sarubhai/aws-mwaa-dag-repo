@@ -1,0 +1,84 @@
+name: MWAA Update
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  mwaa_update:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+      
+      - name: Restore Timestamps
+        uses: chetan/git-restore-mtime-action@v1
+
+      - name: Install AWS CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          # pip3 install awscli
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install --update
+
+      - name: Configure AWS credentials
+        run: |
+          mkdir -p ~/.aws/
+          echo "[default]" >> ~/.aws/credentials
+          echo "aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> ~/.aws/credentials
+          echo "aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> ~/.aws/credentials
+          echo "aws_session_token=${{ secrets.AWS_SESSION_TOKEN }}" >> ~/.aws/credentials
+          echo "region=${{ secrets.AWS_DEFAULT_REGION }}" >> ~/.aws/credentials
+
+      - name: Update dags
+        run: |
+          aws s3 sync dags s3://${{ secrets.MWAA_BUCKET_NAME }}/dags --exclude '*' --include '*.py' --include '*.sql' --acl private --follow-symlinks --delete
+
+      - name: Update plugins.zip
+        run: |
+          cd plugins
+          chmod -R 755 .
+          zip -r plugins.zip . -x '__pycache__/*' -x '**/__pycache__/*'
+          cd ..
+          aws s3 sync plugins s3://${{ secrets.MWAA_BUCKET_NAME }}/plugins --exclude '*' --include '*.zip' --include '*.py' --acl private --follow-symlinks --delete
+
+      - name: Update requirements.txt
+        run: |
+          aws s3 sync requirements s3://${{ secrets.MWAA_BUCKET_NAME }}/requirements --exclude '*' --include '*.txt' --acl private --follow-symlinks --delete
+
+      - name: Update startup.sh
+        run: |
+          aws s3 sync startup_script s3://${{ secrets.MWAA_BUCKET_NAME }}/startup_script --exclude '*' --include '*.sh' --acl private --follow-symlinks --delete
+
+      - name: Update MWAA environment
+        run: |
+          requirements_version=`aws s3api list-object-versions --bucket ${{ secrets.MWAA_BUCKET_NAME }} --prefix requirements/requirements.txt --query 'Versions[?IsLatest].[VersionId]' --output text`
+          plugins_version=`aws s3api list-object-versions --bucket ${{ secrets.MWAA_BUCKET_NAME }} --prefix plugins/plugins.zip --query 'Versions[?IsLatest].[VersionId]' --output text`
+          startup_version=`aws s3api list-object-versions --bucket ${{ secrets.MWAA_BUCKET_NAME }} --prefix startup_script/startup.sh --query 'Versions[?IsLatest].[VersionId]' --output text`
+          
+          mwaa_requirements_version=`aws mwaa get-environment --name ${{ secrets.MWAA_ENVIRONMENT_NAME }} | jq -r '.Environment | .RequirementsS3ObjectVersion'`
+          mwaa_plugins_version=`aws mwaa get-environment --name ${{ secrets.MWAA_ENVIRONMENT_NAME }} | jq -r '.Environment | .PluginsS3ObjectVersion'`
+          mwaa_startup_version=`aws mwaa get-environment --name ${{ secrets.MWAA_ENVIRONMENT_NAME }} | jq -r '.Environment | .StartupScriptS3ObjectVersion'`
+          
+          echo $requirements_version
+          echo $mwaa_requirements_version
+          echo $plugins_version
+          echo $mwaa_plugins_version
+          echo $startup_version
+          echo $mwaa_startup_version
+
+          if [ "$requirements_version" != "$mwaa_requirements_version" ] || [ "$plugins_version" != "$mwaa_plugins_version" ] || [ "$startup_version" != "$mwaa_startup_version" ] 
+          then 
+            aws mwaa update-environment \
+              --name ${{ secrets.MWAA_ENVIRONMENT_NAME }} \
+              --requirements-s3-object-version ${requirements_version} --requirements-s3-path requirements/requirements.txt \
+              --plugins-s3-object-version ${plugins_version} --plugins-s3-path plugins/plugins.zip \
+              --startup-script-s3-object-version ${startup_version} --startup-script-s3-path startup_script/startup.sh 
+          fi
+          
